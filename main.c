@@ -27,8 +27,9 @@ enum __attribute__((__packed__)) {
 	front_porch_ns = 1650,
 	back_porch_ns = 5700,
 	line_data_ns = line_ns - (back_porch_ns + front_porch_ns),
-	line_oversampling = 1,  // Higher values require USB3, not much point though
-	sample_rate_hz = (uint64_t) line_oversampling * horizontal_resolution * billion / line_data_ns,
+	max_sample_rate_hz = 9600000,  // Max for Pico 2206B MSO according to specs
+	ideal_sample_rate_hz = (uint64_t) horizontal_resolution * billion / line_data_ns,
+	sample_rate_hz = ideal_sample_rate_hz < max_sample_rate_hz ? ideal_sample_rate_hz : max_sample_rate_hz,
 	offset_mv = 0,
 	frame_width = 720,
 	frame_height = 625,
@@ -39,7 +40,7 @@ enum __attribute__((__packed__)) {
 static struct scope_config requested_scope_config = {
 	.oversample_ratio = 1,  // Higher values require USB3 (will give more dynamic range in image)
 	.chunk_max_samples = sample_rate_hz / 200,
-	.max_chunks_in_queue = 4,
+	.max_chunks_in_queue = 32,
 	.range_max_mv = 2000,
 	.user_sample_period_ps = (uint64_t) trillion / sample_rate_hz,
 };

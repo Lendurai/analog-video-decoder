@@ -2,7 +2,7 @@
 #include "errors.h"
 #include "scope.h"
 
-#include <time.h>
+#include <unistd.h>
 
 #include "include/ps2000a/ps2000aApi.h"
 
@@ -137,6 +137,8 @@ void scope_init(struct scope *self, const struct scope_config *requested_config,
 	log("Configuring data buffer");
 	uint32_t ratio_mode = requested_config->oversample_ratio > 1 ? PS2000A_RATIO_MODE_AVERAGE : PS2000A_RATIO_MODE_NONE;
 	size_t receive_buffer_length = requested_config->chunk_max_samples * requested_config->max_chunks_in_queue;
+	log("Read chunk size: %uS", requested_config->chunk_max_samples);
+	log("Overview buffer capacity: %u reads / %zuS", requested_config->max_chunks_in_queue, receive_buffer_length);
 	adc_sample_t *receive_buffer = malloc(sizeof(*receive_buffer) * receive_buffer_length);
 	self->receive_buffer = receive_buffer;
 	assert_equal(
@@ -152,7 +154,7 @@ void scope_init(struct scope *self, const struct scope_config *requested_config,
 		1e6 / requested_config->user_sample_period_ps
 	);
 	uint32_t max_oversample_ratio = oversample_ratio;
-	log("Estimated memory requirement on device: %.1fMS", receive_buffer_length * oversample_ratio / 1048576.0);
+	log("Receive-buffer size: %.1fMS", receive_buffer_length * oversample_ratio / 1048576.0);
 	assert_equal(
 		PICO_OK,
 		ps2000aGetMaxDownSampleRatio(handle, receive_buffer_length * oversample_ratio, &max_oversample_ratio, ratio_mode, 0)
@@ -163,9 +165,10 @@ void scope_init(struct scope *self, const struct scope_config *requested_config,
 	log("Using oversample ratio %u (max: %u)", oversample_ratio, max_oversample_ratio);
 	uint32_t device_sample_period_ps = requested_config->user_sample_period_ps / oversample_ratio;
 	log(
-		"Requesting sample-rate: %.2fMHz / %u = %.2fMHz",
+		"Requesting sample-rate: %.2fMHz / %u = %.2fMHz (%ups x %u)",
 		1e6 / device_sample_period_ps, oversample_ratio,
-		1e6 / device_sample_period_ps / oversample_ratio
+		1e6 / device_sample_period_ps / oversample_ratio,
+		device_sample_period_ps, oversample_ratio
 	);
 	assert_equal(
 		PICO_OK,
@@ -182,9 +185,10 @@ void scope_init(struct scope *self, const struct scope_config *requested_config,
 		)
 	);
 	log(
-		"Using sample-rate: %.2fMHz / %u = %.2fMHz",
+		"Using sample-rate: %.2fMHz / %u = %.2fMHz (%ups x %u)",
 		1e6 / device_sample_period_ps, oversample_ratio,
-		1e6 / device_sample_period_ps / oversample_ratio
+		1e6 / device_sample_period_ps / oversample_ratio,
+		device_sample_period_ps, oversample_ratio
 	);
 	/* ADC->Voltage conversion */
 	log("Determining ADC/voltage conversion");
@@ -192,18 +196,20 @@ void scope_init(struct scope *self, const struct scope_config *requested_config,
 		PICO_OK,
 		ps2000aMaximumValue(handle, &self->adc_max_value)
 	);
+	uint64_t user_sample_period_ps = device_sample_period_ps * oversample_ratio;
 	/* Rest */
 	self->overflow = false;
-	self->poll_interval_ns = (uint64_t) requested_config->chunk_max_samples * device_sample_period_ps / 1000 / oversample_ratio / 2;
+	self->poll_interval_us = (uint64_t) requested_config->chunk_max_samples * user_sample_period_ps / 1000000 / 2;
 	self->raw_buffer = NULL;
 	self->samples_read = 0;
+	log("Poll-loop interval: %uus", self->poll_interval_us);
 	/* Return adjusted config */
 	if (actual_config) {
 		actual_config->oversample_ratio = requested_config->oversample_ratio;
 		actual_config->chunk_max_samples = requested_config->chunk_max_samples;
 		actual_config->max_chunks_in_queue = requested_config->max_chunks_in_queue;
 		actual_config->range_max_mv = range_mv;
-		actual_config->user_sample_period_ps = device_sample_period_ps * oversample_ratio;
+		actual_config->user_sample_period_ps = user_sample_period_ps;
 		actual_config->device_sample_period_ps = device_sample_period_ps;
 	}
 }
@@ -226,14 +232,14 @@ void scope_capture(struct scope *self, struct buffer *out, bool *overflow)
 	/* Wait for callback to provide some data */
 	while (self->raw_buffer == NULL) {
 		PICO_STATUS status;
-		while ((status = ps2000aGetStreamingLatestValues(self->handle, scope_on_data, self)) == PICO_BUSY) {
-			struct timespec poll_delay = {
-				.tv_sec = 0,
-				.tv_nsec = self->poll_interval_ns,
-			};
-			nanosleep(&poll_delay, &poll_delay);
+		status = ps2000aGetStreamingLatestValues(self->handle, scope_on_data, self);
+		if (status != PICO_BUSY) {
+			assert_equal(PICO_OK, status);
+			if (self->raw_buffer) {
+				break;
+			}
 		}
-		assert_equal(PICO_OK, status);
+		usleep(self->poll_interval_us);
 	}
 	/* Steal current ADC raw-data chunk list */
 	struct adc_buffer *raw_buffer;

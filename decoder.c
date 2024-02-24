@@ -219,7 +219,7 @@ static void decoder_process_pulse(struct decoder *self, struct pulse_info *pulse
 	} else {
 		self->errors.unrecognised_pulse_type++;
 		pattern_buffer_clear(&self->pattern_buffer);
-		/* decoder_debug_log_pulse(type, pulse_ns, pulse_high_ns, true); */
+		decoder_debug_log_pulse(type, pulse_ns, pulse_high_ns, true);
 	}
 	/* decoder_debug_log_pulse(type, pulse_ns, pulse_high_ns, false); */
 }

@@ -23,7 +23,7 @@ struct scope
 	struct adc_buffer *raw_buffer;
 	offset_t samples_read;
 	bool overflow;
-	uint32_t poll_interval_ns;
+	uint32_t poll_interval_us;
 };
 
 struct scope_config
@@ -34,9 +34,9 @@ struct scope_config
 	uint32_t max_chunks_in_queue;
 	/* Input/Output */
 	sample_t range_max_mv;
-	uint32_t user_sample_period_ps;
+	uint64_t user_sample_period_ps;
 	/* Output */
-	uint32_t device_sample_period_ps;
+	uint64_t device_sample_period_ps;
 };
 
 void scope_init(struct scope *self, const struct scope_config *requested_config, struct scope_config *actual_config);
