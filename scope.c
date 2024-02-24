@@ -2,6 +2,8 @@
 #include "errors.h"
 #include "scope.h"
 
+#include <time.h>
+
 #include "include/ps2000a/ps2000aApi.h"
 
 static const unsigned pico_range_mv[PS2000A_MAX_RANGES] = {
@@ -41,7 +43,6 @@ static void scope_on_data(
 	void *pself
 ) {
 	struct scope *self = pself;
-	assert_equal(0, overflow);
 	if (sample_count == 0) {
 		return;
 	}
@@ -50,27 +51,65 @@ static void scope_on_data(
 	buffer->length = sample_count;
 	memcpy(buffer->data, &self->receive_buffer[start_index], sample_count * sizeof(*buffer->data));
 	self->samples_read += sample_count;
-	pthread_mutex_lock(&self->mutex);
 	if (self->raw_buffer) {
 		self->raw_buffer->next = buffer;
 	}
 	buffer->prev = self->raw_buffer;
 	buffer->next = NULL;
 	self->raw_buffer = buffer;
-	pthread_mutex_unlock(&self->mutex);
+	self->overflow = self->overflow || overflow;
 }
 
-void scope_init(struct scope *self, uint32_t *period_ns, size_t chunk_length, sample_t range_max_mv)
+static inline sample_t scope_convert_adc_sample_to_mv(struct scope *self, adc_sample_t adc_value)
 {
+	return ((int32_t) adc_value) * self->range_max_mv / self->adc_max_value;
+}
+
+static void scope_log_unit_info(struct scope *self)
+{
+	short handle = self->handle;
+	int8_t info[100];
+	int16_t tmp;
+	assert_equal(PICO_OK, ps2000aGetUnitInfo(handle, &info[0], sizeof(info), &tmp, PICO_DRIVER_VERSION));
+	log("Driver version: %s", info);
+	assert_equal(PICO_OK, ps2000aGetUnitInfo(handle, &info[0], sizeof(info), &tmp, PICO_USB_VERSION));
+	log("USB version: %s", info);
+	assert_equal(PICO_OK, ps2000aGetUnitInfo(handle, &info[0], sizeof(info), &tmp, PICO_HARDWARE_VERSION));
+	log("Hardware version: %s", info);
+	assert_equal(PICO_OK, ps2000aGetUnitInfo(handle, &info[0], sizeof(info), &tmp, PICO_VARIANT_INFO));
+	log("Device variant: %s", info);
+	assert_equal(PICO_OK, ps2000aGetUnitInfo(handle, &info[0], sizeof(info), &tmp, PICO_BATCH_AND_SERIAL));
+	log("Device batch and serial: %s", info);
+	assert_equal(PICO_OK, ps2000aGetUnitInfo(handle, &info[0], sizeof(info), &tmp, PICO_CAL_DATE));
+	log("Device calibration date: %s", info);
+	assert_equal(PICO_OK, ps2000aGetUnitInfo(handle, &info[0], sizeof(info), &tmp, PICO_KERNEL_VERSION));
+	log("Kernel driver version: %s", info);
+	assert_equal(PICO_OK, ps2000aGetUnitInfo(handle, &info[0], sizeof(info), &tmp, PICO_DIGITAL_HARDWARE_VERSION));
+	log("Device digital hardware version: %s", info);
+	assert_equal(PICO_OK, ps2000aGetUnitInfo(handle, &info[0], sizeof(info), &tmp, PICO_ANALOGUE_HARDWARE_VERSION));
+	log("Device analog hardware version: %s", info);
+	assert_equal(PICO_OK, ps2000aGetUnitInfo(handle, &info[0], sizeof(info), &tmp, PICO_FIRMWARE_VERSION_1));
+	log("Device firmware version 1: %s", info);
+	assert_equal(PICO_OK, ps2000aGetUnitInfo(handle, &info[0], sizeof(info), &tmp, PICO_FIRMWARE_VERSION_2));
+	log("Device firmware version 2: %s", info);
+}
+
+/******************************************************************************/
+
+void scope_init(struct scope *self, const struct scope_config *requested_config, struct scope_config *actual_config)
+{
+	/* Voltage range */
+	log("Requesting range: %.3fV", requested_config->range_max_mv / 1000.0f);
 	PS2000A_RANGE range_id;
 	assert_equal(
 		true,
-		get_range_id(range_max_mv, &range_id)
+		get_range_id(requested_config->range_max_mv, &range_id)
 	);
-	size_t receive_buffer_length = chunk_length * 10;
-	adc_sample_t *receive_buffer = malloc(sizeof(*receive_buffer) * receive_buffer_length);
-	self->receive_buffer = receive_buffer;
-	self->range_max_mv = pico_range_mv[range_id];
+	uint32_t range_mv = pico_range_mv[range_id];
+	self->range_max_mv = range_mv;
+	log("Using range: %.3fV", range_mv / 1000.0f);
+	/* Device */
+	log("Connecting to scope");
 	short handle;
 	assert_equal(
 		PICO_OK,
@@ -78,6 +117,10 @@ void scope_init(struct scope *self, uint32_t *period_ns, size_t chunk_length, sa
 	);
 	assert_not_equal(-1, handle, "Failed to open oscilloscope");
 	assert_not_equal(0, handle, "No oscilloscope found");
+	self->handle = handle;
+	/* Device info */
+	scope_log_unit_info(self);
+	/* Configure channels */
 	assert_equal(
 		PICO_OK,
 		ps2000aSetChannel(handle, PS2000A_CHANNEL_A, true, PS2000A_DC, range_id, 0)
@@ -90,22 +133,79 @@ void scope_init(struct scope *self, uint32_t *period_ns, size_t chunk_length, sa
 		PICO_OK,
 		ps2000aSetSimpleTrigger(handle, false, PS2000A_CHANNEL_A, 0, PS2000A_RISING, 0, 0)
 	);
+	/* Buffers */
+	log("Configuring data buffer");
+	uint32_t ratio_mode = requested_config->oversample_ratio > 1 ? PS2000A_RATIO_MODE_AVERAGE : PS2000A_RATIO_MODE_NONE;
+	size_t receive_buffer_length = requested_config->chunk_max_samples * requested_config->max_chunks_in_queue;
+	adc_sample_t *receive_buffer = malloc(sizeof(*receive_buffer) * receive_buffer_length);
+	self->receive_buffer = receive_buffer;
 	assert_equal(
 		PICO_OK,
-		ps2000aSetDataBuffer(handle, PS2000A_CHANNEL_A, self->receive_buffer, receive_buffer_length, 0, PS2000A_RATIO_MODE_NONE)
+		ps2000aSetDataBuffer(handle, PS2000A_CHANNEL_A, self->receive_buffer, receive_buffer_length, 0, ratio_mode)
+	);
+	/* Stream (sample-rate + oversample ratio) */
+	log("Configuring stream");
+	uint32_t oversample_ratio = requested_config->oversample_ratio;
+	log(
+		"Requesting oversample ratio %u @ reduced sample-rate %.2fMHz",
+		oversample_ratio,
+		1e6 / requested_config->user_sample_period_ps
+	);
+	uint32_t max_oversample_ratio = oversample_ratio;
+	log("Estimated memory requirement on device: %.1fMS", receive_buffer_length * oversample_ratio / 1048576.0);
+	assert_equal(
+		PICO_OK,
+		ps2000aGetMaxDownSampleRatio(handle, receive_buffer_length * oversample_ratio, &max_oversample_ratio, ratio_mode, 0)
+	);
+	if (oversample_ratio > max_oversample_ratio) {
+		oversample_ratio = max_oversample_ratio;
+	}
+	log("Using oversample ratio %u (max: %u)", oversample_ratio, max_oversample_ratio);
+	uint32_t device_sample_period_ps = requested_config->user_sample_period_ps / oversample_ratio;
+	log(
+		"Requesting sample-rate: %.2fMHz / %u = %.2fMHz",
+		1e6 / device_sample_period_ps, oversample_ratio,
+		1e6 / device_sample_period_ps / oversample_ratio
 	);
 	assert_equal(
 		PICO_OK,
-		ps2000aRunStreaming(handle, period_ns, PS2000A_NS, 0, 0, false, 1, PS2000A_RATIO_MODE_NONE, chunk_length)
+		ps2000aRunStreaming(
+			handle,
+			&device_sample_period_ps,
+			PS2000A_PS,
+			0,
+			0,
+			false,
+			oversample_ratio,
+			ratio_mode,
+			requested_config->chunk_max_samples
+		)
 	);
-	self->handle = handle;
-	self->raw_buffer = NULL;
-	self->samples_read = 0;
+	log(
+		"Using sample-rate: %.2fMHz / %u = %.2fMHz",
+		1e6 / device_sample_period_ps, oversample_ratio,
+		1e6 / device_sample_period_ps / oversample_ratio
+	);
+	/* ADC->Voltage conversion */
+	log("Determining ADC/voltage conversion");
 	assert_equal(
 		PICO_OK,
 		ps2000aMaximumValue(handle, &self->adc_max_value)
 	);
-	pthread_mutex_init(&self->mutex, NULL);
+	/* Rest */
+	self->overflow = false;
+	self->poll_interval_ns = (uint64_t) requested_config->chunk_max_samples * device_sample_period_ps / 1000 / oversample_ratio / 2;
+	self->raw_buffer = NULL;
+	self->samples_read = 0;
+	/* Return adjusted config */
+	if (actual_config) {
+		actual_config->oversample_ratio = requested_config->oversample_ratio;
+		actual_config->chunk_max_samples = requested_config->chunk_max_samples;
+		actual_config->max_chunks_in_queue = requested_config->max_chunks_in_queue;
+		actual_config->range_max_mv = range_mv;
+		actual_config->user_sample_period_ps = device_sample_period_ps * oversample_ratio;
+		actual_config->device_sample_period_ps = device_sample_period_ps;
+	}
 }
 
 void scope_destroy(struct scope *self)
@@ -119,39 +219,31 @@ void scope_destroy(struct scope *self)
 		PICO_OK,
 		ps2000aCloseUnit(handle)
 	);
-	pthread_mutex_destroy(&self->mutex);
 }
 
-bool scope_capture(struct scope *self)
+void scope_capture(struct scope *self, struct buffer *out, bool *overflow)
 {
-	PICO_STATUS status = ps2000aGetStreamingLatestValues(self->handle, scope_on_data, self);
-	if (status == PICO_BUSY) {
-		return false;
+	/* Wait for callback to provide some data */
+	while (self->raw_buffer == NULL) {
+		PICO_STATUS status;
+		while ((status = ps2000aGetStreamingLatestValues(self->handle, scope_on_data, self)) == PICO_BUSY) {
+			struct timespec poll_delay = {
+				.tv_sec = 0,
+				.tv_nsec = self->poll_interval_ns,
+			};
+			nanosleep(&poll_delay, &poll_delay);
+		}
+		assert_equal(PICO_OK, status);
 	}
-	assert_equal(
-		PICO_OK,
-		status
-	);
-	return true;
-}
-
-static inline sample_t scope_convert_adc_sample_to_mv(struct scope *self, adc_sample_t adc_value)
-{
-	return ((int32_t) adc_value) * self->range_max_mv / self->adc_max_value;
-}
-
-bool scope_take_data(struct scope *self, struct buffer *out)
-{
-	/* Steal current ADC-data chain */
+	/* Steal current ADC raw-data chunk list */
 	struct adc_buffer *raw_buffer;
-	pthread_mutex_lock(&self->mutex);
 	raw_buffer = self->raw_buffer;
 	self->raw_buffer = NULL;
-	pthread_mutex_unlock(&self->mutex);
-	if (raw_buffer == NULL) {
-		return false;
-	}
-	while (raw_buffer->prev) {
+	/* Overflow flag */
+	*overflow = self->overflow;
+	self->overflow = false;
+	/* Convert ADC values to voltages */
+	while (raw_buffer && raw_buffer->prev) {
 		raw_buffer = raw_buffer->prev;
 	}
 	while (raw_buffer) {
@@ -164,5 +256,4 @@ bool scope_take_data(struct scope *self, struct buffer *out)
 		raw_buffer = raw_buffer->next;
 		free(victim);
 	}
-	return true;
 }

@@ -9,24 +9,26 @@
 #include <signal.h>
 #include <time.h>
 #include <poll.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <pthread.h>
 #include <sys/signalfd.h>
 #include <sys/timerfd.h>
 #include <sys/eventfd.h>
 
-enum {
-	thousand = 1000,
-	million = thousand * thousand,
-	billion = thousand * million,
+/* Note: high resolution / line-oversampling / data-rate requires USB3 */
+enum __attribute__((__packed__)) {
+	thousand = (uint64_t) 1000,
+	million = (uint64_t) thousand * thousand,
+	billion = (uint64_t) thousand * million,
+	trillion = (uint64_t) thousand * billion,
 	horizontal_resolution = 720,
 	line_ns = 64000,
 	front_porch_ns = 1650,
 	back_porch_ns = 5700,
 	line_data_ns = line_ns - (back_porch_ns + front_porch_ns),
-	oversampling = 1,  // Greater than 1 requires USB3 conection
-	sample_rate = oversampling * horizontal_resolution * 1LL * billion / line_data_ns,
-	target_sample_period_ns = billion / sample_rate,
-	chunk_length = sample_rate / 50,
-	poll_interval_us = target_sample_period_ns * chunk_length / 1000 / 4,
+	line_oversampling = 1,  // Higher values require USB3, not much point though
+	sample_rate_hz = (uint64_t) line_oversampling * horizontal_resolution * billion / line_data_ns,
 	offset_mv = 0,
 	frame_width = 720,
 	frame_height = 625,
@@ -34,19 +36,25 @@ enum {
 	metrics_period_s = 5,
 };
 
-#define DUTY_U8(state_duration, pulse_duration) ((state_duration) * 256 / (pulse_duration))
+static struct scope_config requested_scope_config = {
+	.oversample_ratio = 1,  // Higher values require USB3 (will give more dynamic range in image)
+	.chunk_max_samples = sample_rate_hz / 200,
+	.max_chunks_in_queue = 4,
+	.range_max_mv = 2000,
+	.user_sample_period_ps = (uint64_t) trillion / sample_rate_hz,
+};
 
 /* For the weird chinese camera, all pretty standard values */
 /* With a lot of help from http://martin.hinner.info/vga/pal.html */
 static struct decoder_config decoder_config = {
-	.sample_period_ns = 0,  // Calculated when initialising scope
+	.sample_period_ps = 0,  // Calculated when initialising scope
 	.interlaced = true,
 	.frame_width = frame_width,
 	.frame_height = frame_height,
 	.sync_threshold = 200 + offset_mv,
 	.black_level = 300 + offset_mv,
 	.white_level = 1000 + offset_mv,
-	.max_backlog_samples = sample_rate / 4, // Must be longer than 2x frame duration
+	.max_backlog_samples = sample_rate_hz / 10,  // Must be longer than 2x frame duration
 	.sync_duration_ns = line_ns / 2,
 	.line_duration_ns = line_ns,
 	.equaliser_low_ns = 2350,
@@ -54,7 +62,7 @@ static struct decoder_config decoder_config = {
 	.horizontal_sync_low_ns = 4700,
 	.front_porch_ns = front_porch_ns,
 	.back_porch_ns = back_porch_ns,
-	.tolerance_ns = 250,
+	.tolerance_ns = 250,  // Much higher than needed
 };
 
 static int ending;
@@ -72,9 +80,29 @@ static struct buffer image_frames;
 static offset_t frame_counter;
 static struct decoder_errors decoder_errors;
 
-static pthread_t worker_receiver;
-static pthread_t worker_decoder;
-static pthread_t worker_image_encoder;
+struct worker
+{
+	const char *name;
+	void (*entry_point)();
+	pthread_t thread;
+};
+
+static void run_receiver();
+static void run_decoder();
+static void run_image_encoder();
+
+static struct worker worker_receiver = {
+	.name = "Receiver",
+	.entry_point = run_receiver,
+};
+static struct worker worker_decoder = {
+	.name = "Decoder",
+	.entry_point = run_decoder,
+};
+static struct worker worker_image_encoder = {
+	.name = "Image encoder",
+	.entry_point = run_image_encoder,
+};
 
 static bool is_not_ending()
 {
@@ -96,50 +124,48 @@ static void set_ending(const char *reason)
 	pthread_cond_signal(&image_frames_cond);
 }
 
-static void *start_worker(void *arg)
-{
-	void (*entry_point)() = arg;
-	entry_point();
-	return NULL;
-}
-
 void run_receiver()
 {
+	struct buffer chunks;
+	bool overflow;
+	buffer_init(&chunks);
 	while (is_not_ending()) {
-		bool has_data;
-		has_data = scope_capture(&scope);
-		if (has_data) {
+		scope_capture(&scope, &chunks, &overflow);
+		if (overflow) {
+			log("Receiver overrun");
+			buffer_clear(&chunks);
+		} else {
 			pthread_mutex_lock(&mutex);
-			has_data = scope_take_data(&scope, &analog_signal);
-			if (has_data) {
-				pthread_cond_signal(&analog_signal_cond);
-			}
+			buffer_concatenate(&analog_signal, &chunks);
+			pthread_cond_signal(&analog_signal_cond);
 			pthread_mutex_unlock(&mutex);
-		}
-		if (!has_data) {
-			usleep(poll_interval_us);
-			continue;
 		}
 	}
 	pthread_cond_signal(&analog_signal_cond);
+	buffer_destroy(&chunks);
 }
 
 void run_decoder()
 {
+	struct buffer chunks;
 	struct decoder decoder;
+	buffer_init(&chunks);
 	decoder_init(&decoder, &decoder_config);
 	const uint32_t frame_bytes = decoder_config.frame_width * decoder_config.frame_height;
 	while (is_not_ending()) {
+		/* Wait for analog signal data */
 		pthread_mutex_lock(&mutex);
 		while (buffer_is_empty(&analog_signal) && is_not_ending()) {
 			pthread_cond_wait(&analog_signal_cond, &mutex);
 		}
-		decoder_bind_and_steal(&decoder, &analog_signal);
-		struct timespec now;
-		assert_equal(0, clock_gettime(CLOCK_MONOTONIC, &now));
-		decoder_reset_error_counters(&decoder, &decoder_errors);
+		buffer_concatenate(&chunks, &analog_signal);
 		pthread_mutex_unlock(&mutex);
+		/* Pass to decoder and accumulate error counters */
+		decoder_bind_and_steal(&decoder, &chunks);
+		decoder_reset_error_counters(&decoder, &decoder_errors);
+		/* Read frame by frame back from decoder */
 		while (decoder_read_frame(&decoder)) {
+			/* Write frame to image encoder queue */
 			pthread_mutex_lock(&mutex);
 			struct buffer_chunk *frame = buffer_append(&image_frames, frame_bytes);
 			frame->offset = frame_counter++;
@@ -149,6 +175,7 @@ void run_decoder()
 		}
 	}
 	decoder_destroy(&decoder);
+	buffer_destroy(&chunks);
 	pthread_cond_signal(&image_frames_cond);
 }
 
@@ -157,24 +184,26 @@ void run_image_encoder()
 	struct buffer frames;
 	buffer_init(&frames);
 	while (is_not_ending()) {
-			pthread_mutex_lock(&mutex);
-			while (buffer_is_empty(&image_frames) && is_not_ending()) {
-				pthread_cond_wait(&image_frames_cond, &mutex);
-			}
-			buffer_concatenate(&frames, &image_frames);
-			pthread_mutex_unlock(&mutex);
-			if (isatty(STDOUT_FILENO)) {
-				log("Frame decoded!");
-			} else {
-				struct buffer_chunk *frame = frames.tail;
-				while (frame) {
-					if (!jpeg_write_image(stdout, frame_width, frame_height, false, frame->data, jpeg_quality)) {
-						set_ending("Encoder worker failed to write JPEG");
-					}
-					frame = frame->next;
+		/* Read raw frame from image encoder queue */
+		pthread_mutex_lock(&mutex);
+		while (buffer_is_empty(&image_frames) && is_not_ending()) {
+			pthread_cond_wait(&image_frames_cond, &mutex);
+		}
+		buffer_concatenate(&frames, &image_frames);
+		pthread_mutex_unlock(&mutex);
+		/* Encode and emit frame / notify about frame */
+		if (isatty(STDOUT_FILENO)) {
+			log("Frame decoded!");
+		} else {
+			struct buffer_chunk *frame = frames.tail;
+			while (frame) {
+				if (!jpeg_write_image(stdout, frame_width, frame_height, false, frame->data, jpeg_quality)) {
+					set_ending("Encoder worker failed to write JPEG");
 				}
+				frame = frame->next;
 			}
-			buffer_clear(&frames);
+		}
+		buffer_clear(&frames);
 	}
 	buffer_destroy(&frames);
 }
@@ -203,19 +232,39 @@ static void log_metrics()
 	}
 }
 
+static void *worker_wrapper(void *arg)
+{
+	const struct worker *worker = arg;
+	assert_equal(0, pthread_setname_np(pthread_self(), worker->name));
+	log("Starting worker %s", worker->name);
+	worker->entry_point();
+	log("Exiting worker %s", worker->name);
+	return NULL;
+}
+
+static void start_worker(struct worker *worker)
+{
+	pthread_create(&worker->thread, NULL, worker_wrapper, worker);
+}
+
+static void wait_worker(struct worker *worker)
+{
+	pthread_join(worker->thread, NULL);
+}
+
 static void start_pipeline()
 {
-	pthread_create(&worker_receiver, NULL, start_worker, run_receiver);
-	pthread_create(&worker_decoder, NULL, start_worker, run_decoder);
-	pthread_create(&worker_image_encoder, NULL, start_worker, run_image_encoder);
+	start_worker(&worker_receiver);
+	start_worker(&worker_decoder);
+	start_worker(&worker_image_encoder);
 }
 
 static void stop_pipeline()
 {
 	set_ending("Pipeline stopping");
-	pthread_join(worker_receiver, NULL);
-	pthread_join(worker_decoder, NULL);
-	pthread_join(worker_image_encoder, NULL);
+	wait_worker(&worker_receiver);
+	wait_worker(&worker_decoder);
+	wait_worker(&worker_image_encoder);
 }
 
 static void main_loop()
@@ -283,15 +332,9 @@ static void main_loop()
 
 int main(int argc, char *argv[])
 {
-	int range_mv = 1500;
-	log("Initialising scope");
-	log(" Target period = %uns (%.3fMHz)", (unsigned) target_sample_period_ns, 1e3 / target_sample_period_ns);
-	log(" Target range = %.3fV", range_mv / 1000.0f);
-	uint32_t actual_sample_period_ns = target_sample_period_ns;
-	scope_init(&scope, &actual_sample_period_ns, chunk_length, range_mv);
-	log(" Actual period = %uns (%.3fMHz)", (unsigned) actual_sample_period_ns, 1e3 / actual_sample_period_ns);
-	log(" Actual range = %.3fV", scope.range_max_mv / 1000.0f);
-	decoder_config.sample_period_ns = actual_sample_period_ns;
+	struct scope_config actual_scope_config;
+	scope_init(&scope, &requested_scope_config, &actual_scope_config);
+	decoder_config.sample_period_ps = actual_scope_config.user_sample_period_ps;
 	/* Inter-thread queues */
 	buffer_init(&analog_signal);
 	buffer_init(&image_frames);

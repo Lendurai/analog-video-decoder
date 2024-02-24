@@ -6,6 +6,7 @@ CFLAGS += -g
 CFLAGS += -flto -ffunction-sections -fdata-sections -Wl,--gc-sections
 CFLAGS += -O2 -march=native -mtune=native
 CFLAGS += -L lib/
+CFLAGS += -D_GNU_SOURCE
 
 sources := $(wildcard *.c)
 objects := $(sources:%.c=%.o)

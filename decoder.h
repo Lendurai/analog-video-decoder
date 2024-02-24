@@ -2,10 +2,11 @@
 #include "stdinc.h"
 #include "buffer.h"
 #include "pulse_width.h"
+#include "pattern_buffer.h"
 
 struct decoder_config
 {
-	uint32_t sample_period_ns;
+	uint32_t sample_period_ps;
 	bool interlaced;
 	uint32_t frame_width;
 	uint32_t frame_height;
@@ -21,11 +22,6 @@ struct decoder_config
 	uint32_t front_porch_ns;
 	uint32_t back_porch_ns;
 	uint32_t tolerance_ns;
-};
-
-enum
-{
-	pulse_history_length = 15,
 };
 
 struct decoder_errors
@@ -48,7 +44,7 @@ struct decoder
 	struct pulse_analyser pulse_analyser;
 	struct pulse_stream_reader pulse_stream_reader;
 	/* PAL decoder state */
-	char pulse_pattern[pulse_history_length];
+	struct pattern_buffer pattern_buffer;
 	/* Image buffer */
 	uint32_t next_line;
 	uint8_t *frame;

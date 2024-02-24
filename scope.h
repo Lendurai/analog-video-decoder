@@ -21,11 +21,24 @@ struct scope
 	adc_sample_t adc_max_value;
 	adc_sample_t *receive_buffer;
 	struct adc_buffer *raw_buffer;
-	pthread_mutex_t mutex;
 	offset_t samples_read;
+	bool overflow;
+	uint32_t poll_interval_ns;
 };
 
-void scope_init(struct scope *self, uint32_t *period_ns, size_t chunk_length, sample_t range_max_mv);
-bool scope_capture(struct scope *self);
+struct scope_config
+{
+	/* Input */
+	uint32_t oversample_ratio;
+	uint32_t chunk_max_samples;
+	uint32_t max_chunks_in_queue;
+	/* Input/Output */
+	sample_t range_max_mv;
+	uint32_t user_sample_period_ps;
+	/* Output */
+	uint32_t device_sample_period_ps;
+};
+
+void scope_init(struct scope *self, const struct scope_config *requested_config, struct scope_config *actual_config);
+void scope_capture(struct scope *self, struct buffer *out, bool *overflow);
 void scope_destroy(struct scope *self);
-bool scope_take_data(struct scope *self, struct buffer *out);

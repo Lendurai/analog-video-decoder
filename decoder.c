@@ -1,7 +1,13 @@
 #include "decoder.h"
 #include "buffer.h"
 #include "errors.h"
+#include "pattern_buffer.h"
 #include "pulse_width.h"
+
+enum
+{
+	longest_sync_pattern_length = 15,
+};
 
 enum pulse_type
 {
@@ -11,6 +17,17 @@ enum pulse_type
 	pulse_type_horizontal = 'h',
 	pulse_type_field = 'f',
 };
+
+enum pattern_type
+{
+	pattern_type_none,
+	pattern_type_next_frame,
+	pattern_type_next_field,
+};
+
+/* REVERSED, i.e. first char is last pulse of pattern */
+static const char pattern_next_frame[longest_sync_pattern_length] = "eeeeevvvvveeeee";
+static const char pattern_next_field[longest_sync_pattern_length] = "feeeevvvvveeeee";
 
 static uint8_t *decoder_next_line(struct decoder *self)
 {
@@ -75,8 +92,8 @@ static void decoder_process_line(struct decoder *self, offset_t high_begin, offs
 		return;
 	}
 	size_t width = self->config.frame_width;
-	offset_t back_porch = self->config.back_porch_ns / self->config.sample_period_ns;
-	offset_t front_porch = self->config.front_porch_ns / self->config.sample_period_ns;
+	offset_t back_porch = (uint64_t) self->config.back_porch_ns * 1000 / self->config.sample_period_ps;
+	offset_t front_porch = (uint64_t) self->config.front_porch_ns * 1000 / self->config.sample_period_ps;
 	offset_t data_begin = high_begin + back_porch;
 	offset_t data_end = high_end - front_porch;
 	offset_t data_duration = data_end - data_begin;
@@ -91,36 +108,16 @@ static void decoder_process_line(struct decoder *self, offset_t high_begin, offs
 	}
 }
 
-enum pattern_type
-{
-	pattern_type_none,
-	pattern_type_next_frame,
-	pattern_type_next_field,
-};
-
-/* REVERSED, i.e. first char is last pulse of pattern */
-static const char pattern_next_frame[] = "eeeeevvvvveeeee";
-static const char pattern_next_field[] = "feeeevvvvveeeee";
-
-static bool decoder_pattern_equal(const struct decoder *self, const char *test)
-{
-	return strncmp(self->pulse_pattern, test, pulse_history_length) == 0;
-}
-
 static enum pattern_type decoder_get_sync_pattern(struct decoder *self)
 {
-	if (decoder_pattern_equal(self, pattern_next_frame)) {
+	struct pattern_buffer *pattern_buffer = &self->pattern_buffer;
+	if (pattern_buffer_match(pattern_buffer, pattern_next_frame)) {
 		return pattern_type_next_frame;
-	} else if (decoder_pattern_equal(self, pattern_next_field)) {
+	} else if (pattern_buffer_match(pattern_buffer, pattern_next_field)) {
 		return pattern_type_next_field;
 	} else {
 		return pattern_type_none;
 	}
-}
-
-static void decoder_reset_pulse_pattern_decoder(struct decoder *self)
-{
-	memset(&self->pulse_pattern, 0, pulse_history_length);
 }
 
 static void decoder_process_pulse_pattern(struct decoder *self)
@@ -135,18 +132,7 @@ static void decoder_process_pulse_pattern(struct decoder *self)
 	} else if (type == pattern_type_next_field) {
 		decoder_select_field(self, 1);
 	}
-	decoder_reset_pulse_pattern_decoder(self);
-}
-
-static void decoder_accumulate_pulse_pattern(struct decoder *self, enum pulse_type pulse_type)
-{
-	char *pattern = self->pulse_pattern;
-	if (pattern[pulse_history_length - 1] != pulse_type_none) {
-		self->errors.long_sync_pattern++;
-	}
-	memmove(&pattern[1], &pattern[0], pulse_history_length - 1);
-	pattern[0] = pulse_type;
-	/* log("pattern = [%*.*s]", pulse_history_length, pulse_history_length, pattern); */
+	pattern_buffer_clear(&self->pattern_buffer);
 }
 
 static bool is_similar(uint32_t measurement, uint32_t reference, uint32_t tolerance)
@@ -216,20 +202,23 @@ static void decoder_debug_log_pulse(enum pulse_type type, uint32_t pulse_ns, uin
 
 static void decoder_process_pulse(struct decoder *self, struct pulse_info *pulse_info)
 {
-	const uint32_t sample_period = self->config.sample_period_ns;
-	int64_t pulse_samples = pulse_info->end - pulse_info->start;
-	int64_t pulse_high_samples = pulse_info->end - pulse_info->transition;
-	uint32_t pulse_ns = pulse_samples * sample_period;
-	uint32_t pulse_high_ns = pulse_high_samples * sample_period;
+	const uint32_t sample_period_ps = self->config.sample_period_ps;
+	/* We trust that the input is valid, such that these won't go negative */
+	uint64_t pulse_samples = pulse_info->end - pulse_info->start;
+	uint64_t pulse_high_samples = pulse_info->end - pulse_info->transition;
+	uint32_t pulse_ns = pulse_samples * sample_period_ps / 1000;
+	uint32_t pulse_high_ns = pulse_high_samples * sample_period_ps / 1000;
 	enum pulse_type type = decoder_characterise_pulse(self, pulse_ns, pulse_high_ns);
 	if (type == pulse_type_horizontal) {
 		decoder_process_line(self, pulse_info->transition, pulse_info->end);
 	} else if (type != pulse_type_none) {
-		decoder_accumulate_pulse_pattern(self, type);
+		if (!pattern_buffer_next(&self->pattern_buffer, type)) {
+			self->errors.long_sync_pattern++;
+		}
 		decoder_process_pulse_pattern(self);
 	} else {
 		self->errors.unrecognised_pulse_type++;
-		decoder_reset_pulse_pattern_decoder(self);
+		pattern_buffer_clear(&self->pattern_buffer);
 		/* decoder_debug_log_pulse(type, pulse_ns, pulse_high_ns, true); */
 	}
 	/* decoder_debug_log_pulse(type, pulse_ns, pulse_high_ns, false); */
@@ -237,9 +226,9 @@ static void decoder_process_pulse(struct decoder *self, struct pulse_info *pulse
 
 static void decoder_handle_desync(struct decoder *self)
 {
-		pulse_stream_reader_reset(&self->pulse_stream_reader);
-		decoder_reset_pulse_pattern_decoder(self);
-		decoder_reset_frame(self);
+	pulse_stream_reader_reset(&self->pulse_stream_reader);
+	pattern_buffer_clear(&self->pattern_buffer);
+	decoder_reset_frame(self);
 }
 
 static void decoder_bind_chunk(struct decoder *self, struct buffer_chunk *chunk)
@@ -266,6 +255,7 @@ static bool decoder_overrun(struct decoder *self)
 
 void decoder_init(struct decoder *self, const struct decoder_config *config)
 {
+	log("Initialising decoder @ sample-rate = %.2fMHz", 1e6 / config->sample_period_ps);
 	self->config = *config;
 	pulse_analyser_init(&self->pulse_analyser, 0, pulse_right_aligned);
 	pulse_stream_reader_init(&self->pulse_stream_reader, &self->pulse_analyser, config->sync_threshold, false, 0);
@@ -274,7 +264,7 @@ void decoder_init(struct decoder *self, const struct decoder_config *config)
 	self->next_chunk_expected_offset = 0;
 	decoder_reset_frame(self);
 	buffer_init(&self->buffer);
-	decoder_reset_pulse_pattern_decoder(self);
+	pattern_buffer_init(&self->pattern_buffer, longest_sync_pattern_length);
 	decoder_reset_error_counters(self, NULL);
 }
 
@@ -299,6 +289,7 @@ void decoder_bind_and_steal(struct decoder *self, struct buffer *new_data)
 
 void decoder_destroy(struct decoder *self)
 {
+	pattern_buffer_destroy(&self->pattern_buffer);
 	buffer_destroy(&self->buffer);
 	free(self->frame);
 	pulse_stream_reader_destroy(&self->pulse_stream_reader);
